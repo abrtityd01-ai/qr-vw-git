@@ -15,7 +15,7 @@ provider "aws" {
 }
 
 ########################
-# Variables
+# Variables   SE ACTUALIZA AQUI
 ########################
 variable "aws_region" {
   description = "AWS region"
