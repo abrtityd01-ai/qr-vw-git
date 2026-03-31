@@ -1,170 +1,321 @@
-########################
-# 1. VPC + Subnets
-########################
-resource "aws_vpc" "qr_vpc" {
-  cidr_block = "10.0.0.0/16"
-  enable_dns_hostnames = true
-  enable_dns_support   = true
-}
+terraform {
+  required_version = ">= 1.5.0"
 
-resource "aws_subnet" "isolated_a" {
-  vpc_id            = aws_vpc.qr_vpc.id
-  cidr_block        = "10.0.1.0/24"
-  availability_zone = "us-east-1a"
-}
-
-resource "aws_subnet" "isolated_b" {
-  vpc_id            = aws_vpc.qr_vpc.id
-  cidr_block        = "10.0.2.0/24"
-  availability_zone = "us-east-1b"
-}
-
-########################
-# 2. VPC Endpoints
-########################
-resource "aws_security_group" "vpce_sg" {
-  vpc_id = aws_vpc.qr_vpc.id
-
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"]
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
   }
 }
 
-resource "aws_vpc_endpoint" "secretsmanager" {
-  vpc_id            = aws_vpc.qr_vpc.id
-  service_name      = "com.amazonaws.us-east-1.secretsmanager"
-  vpc_endpoint_type = "Interface"
-  subnet_ids        = [aws_subnet.isolated_a.id, aws_subnet.isolated_b.id]
-  security_group_ids = [aws_security_group.vpce_sg.id]
-}
-
-resource "aws_vpc_endpoint" "rds_data" {
-  vpc_id            = aws_vpc.qr_vpc.id
-  service_name      = "com.amazonaws.us-east-1.rds-data"
-  vpc_endpoint_type = "Interface"
-  subnet_ids        = [aws_subnet.isolated_a.id, aws_subnet.isolated_b.id]
-  security_group_ids = [aws_security_group.vpce_sg.id]
+provider "aws" {
+  region = var.aws_region
+  profile = "solser-dev"
 }
 
 ########################
-# 3. Aurora Serverless v2
+# Variables
 ########################
-resource "aws_rds_cluster" "qr_cluster" {
-  engine         = "aurora-mysql"
-  engine_version = "8.0.mysql_aurora.3.05.2"
-  database_name  = "qrdb"
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-east-1"
+}
 
-  master_username = "admin"
+variable "project_name" {
+  description = "Nombre del proyecto"
+  type        = string
+  default     = "qrcode"
+}
+
+variable "environment" {
+  description = "Ambiente"
+  type        = string
+  default     = "dev"
+}
+
+variable "vpc_cidr" {
+  description = "CIDR de la VPC"
+  type        = string
+  default     = "10.10.0.0/16"
+}
+
+variable "public_subnet_cidrs" {
+  description = "CIDRs para subnets públicas"
+  type        = list(string)
+  default     = ["10.10.1.0/24", "10.10.2.0/24"]
+}
+
+variable "private_subnet_cidrs" {
+  description = "CIDRs para subnets privadas"
+  type        = list(string)
+  default     = ["10.10.11.0/24", "10.10.12.0/24"]
+}
+
+variable "allowed_mysql_cidr" {
+  description = "CIDR permitido para acceso MySQL (DEV)"
+  type        = string
+  # cámbialo a tu IP /32
+  default     = "0.0.0.0/0"
+}
+
+variable "db_name" {
+  description = "Nombre de base de datos inicial"
+  type        = string
+  default     = "qrcode"
+}
+
+variable "db_master_username" {
+  description = "Usuario administrador"
+  type        = string
+  default     = "admin"
+}
+
+########################
+# Locals
+########################
+locals {
+  name_prefix = "${var.project_name}-${var.environment}"
+
+  common_tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+########################
+# VPC
+########################
+resource "aws_vpc" "this" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-vpc"
+  })
+}
+
+resource "aws_internet_gateway" "this" {
+  vpc_id = aws_vpc.this.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-igw"
+  })
+}
+
+########################
+# Subnets
+########################
+resource "aws_subnet" "public" {
+  for_each = {
+    az1 = var.public_subnet_cidrs[0]
+    az2 = var.public_subnet_cidrs[1]
+  }
+
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = each.value
+  map_public_ip_on_launch = true
+  availability_zone       = "${var.aws_region}${each.key == "az1" ? "a" : "b"}"
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-public-${each.key}"
+    Tier = "public"
+  })
+}
+
+resource "aws_subnet" "private" {
+  for_each = {
+    az1 = var.private_subnet_cidrs[0]
+    az2 = var.private_subnet_cidrs[1]
+  }
+
+  vpc_id            = aws_vpc.this.id
+  cidr_block        = each.value
+  availability_zone = "${var.aws_region}${each.key == "az1" ? "a" : "b"}"
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-private-${each.key}"
+    Tier = "private"
+  })
+}
+
+########################
+# Route Tables
+########################
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.this.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-public-rt"
+  })
+}
+
+resource "aws_route" "public_internet" {
+  route_table_id         = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.this.id
+}
+
+resource "aws_route_table_association" "public_assoc" {
+  for_each       = aws_subnet.public
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.public.id
+}
+
+########################
+# NAT Gateway (para privadas)
+########################
+resource "aws_eip" "nat" {
+  domain = "vpc"
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-nat-eip"
+  })
+}
+
+resource "aws_nat_gateway" "this" {
+  subnet_id     = values(aws_subnet.public)[0].id
+  allocation_id = aws_eip.nat.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-nat"
+  })
+
+  depends_on = [aws_internet_gateway.this]
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.this.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-private-rt"
+  })
+}
+
+resource "aws_route" "private_to_nat" {
+  route_table_id         = aws_route_table.private.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.this.id
+}
+
+resource "aws_route_table_association" "private_assoc" {
+  for_each       = aws_subnet.private
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.private.id
+}
+
+########################
+# Security Group Aurora
+########################
+resource "aws_security_group" "aurora_sg" {
+  name        = "${local.name_prefix}-aurora-sg"
+  description = "Aurora MySQL access"
+  vpc_id      = aws_vpc.this.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-aurora-sg"
+  })
+}
+
+resource "aws_vpc_security_group_ingress_rule" "mysql" {
+  security_group_id = aws_security_group.aurora_sg.id
+  description       = "MySQL access from DEV CIDR"
+  from_port         = 3306
+  to_port           = 3306
+  ip_protocol       = "tcp"
+  cidr_ipv4         = var.allowed_mysql_cidr
+}
+
+resource "aws_vpc_security_group_egress_rule" "all_out" {
+  security_group_id = aws_security_group.aurora_sg.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
+########################
+# DB Subnet Group
+########################
+resource "aws_db_subnet_group" "aurora_subnets" {
+  name       = "${local.name_prefix}-aurora-subnet-group"
+  subnet_ids = [for s in aws_subnet.private : s.id]
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-aurora-subnet-group"
+  })
+}
+
+########################
+# Aurora Serverless v2
+########################
+resource "aws_rds_cluster" "aurora" {
+  cluster_identifier = "${local.name_prefix}-aurora"
+  engine             = "aurora-mysql"
+#  engine_version     = "8.0.mysql_aurora.3.05.2"
+
+  database_name   = var.db_name
+  master_username = var.db_master_username
+
   manage_master_user_password = true
 
-  db_subnet_group_name = aws_db_subnet_group.qr_subnet_group.name
+  db_subnet_group_name   = aws_db_subnet_group.aurora_subnets.name
+  vpc_security_group_ids = [aws_security_group.aurora_sg.id]
 
   serverlessv2_scaling_configuration {
     min_capacity = 0.5
-    max_capacity = 1.0
+    max_capacity = 4
   }
 
-  storage_encrypted = true
-  enable_http_endpoint = true # Data API
-
+  storage_encrypted   = true
   skip_final_snapshot = true
-}
 
-resource "aws_db_subnet_group" "qr_subnet_group" {
-  name       = "qr-subnet-group"
-  subnet_ids = [
-    aws_subnet.isolated_a.id,
-    aws_subnet.isolated_b.id
-  ]
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-aurora-cluster"
+  })
 }
 
 resource "aws_rds_cluster_instance" "writer" {
-  cluster_identifier = aws_rds_cluster.qr_cluster.id
+  identifier         = "${local.name_prefix}-aurora-writer"
+  cluster_identifier = aws_rds_cluster.aurora.id
   instance_class     = "db.serverless"
-  engine             = aws_rds_cluster.qr_cluster.engine
-}
+  engine             = aws_rds_cluster.aurora.engine
+  engine_version     = aws_rds_cluster.aurora.engine_version
 
-########################
-# 4. IAM para Lambda
-########################
-resource "aws_iam_role" "lambda_role" {
-  name = "qr_lambda_role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "lambda.amazonaws.com"
-      }
-    }]
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-aurora-writer"
   })
 }
 
-resource "aws_iam_policy" "rds_data_api_policy" {
-  name = "rds-data-api-policy"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "rds-data:*"
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
+########################
+# Outputs
+########################
+output "vpc_id" {
+  value = aws_vpc.this.id
 }
 
-resource "aws_iam_role_policy_attachment" "attach_policy" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = aws_iam_policy.rds_data_api_policy.arn
+output "public_subnets" {
+  value = [for s in aws_subnet.public : s.id]
 }
 
-########################
-# 5. Lambda
-########################
-resource "aws_lambda_function" "qr_processor" {
-  function_name = "qr-processor"
-  role          = aws_iam_role.lambda_role.arn
-  runtime       = "nodejs20.x"
-  handler       = "index.handler"
-
-  filename         = "lambda.zip" # Debes empaquetar el código
-  source_code_hash = filebase64sha256("lambda.zip")
-
-  environment {
-    variables = {
-      DB_CLUSTER_ARN = aws_rds_cluster.qr_cluster.arn
-      SECRET_ARN     = aws_rds_cluster.qr_cluster.master_user_secret[0].secret_arn
-    }
-  }
-
-  tracing_config {
-    mode = "Active"
-  }
+output "private_subnets" {
+  value = [for s in aws_subnet.private : s.id]
 }
 
-########################
-# 6. Outputs
-########################
-output "cluster_arn" {
-  value = aws_rds_cluster.qr_cluster.arn
+output "aurora_sg_id" {
+  value = aws_security_group.aurora_sg.id
 }
 
-output "secret_arn" {
-  value = aws_rds_cluster.qr_cluster.master_user_secret[0].secret_arn
+output "db_cluster_endpoint" {
+  value = aws_rds_cluster.aurora.endpoint
+}
+
+output "db_reader_endpoint" {
+  value = aws_rds_cluster.aurora.reader_endpoint
+}
+
+output "db_master_user_secret_arn" {
+  value     = aws_rds_cluster.aurora.master_user_secret[0].secret_arn
+  sensitive = true
 }
