@@ -15,7 +15,7 @@ provider "aws" {
 }
 
 ########################
-# Variables   SE ACTUALIZA AQUI
+# Variables   SE ACTUALIZA AQUI Esta version esta funcionado. con esta se genero la infraestructura 
 ########################
 variable "aws_region" {
   description = "AWS region"
